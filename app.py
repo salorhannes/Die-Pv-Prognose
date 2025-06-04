@@ -1,66 +1,65 @@
-
-import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import pvlib
 from datetime import datetime, timedelta
+import requests
+import matplotlib.pyplot as plt
 
-# 📂 Feedback laden
-def lade_feedback():
-    try:
-        return pd.read_csv("feedback.csv", parse_dates=["datum"])
-    except FileNotFoundError:
-        return pd.DataFrame(columns=["datum", "tatsaechlicher_ertrag_kwh"])
+LAT, LON = 48.13, 11.58  # Beispielkoordinaten (München)
 
-# ☀ Wetterdaten simulieren (Platzhalter)
-def lade_wetterdaten():
-    index = pd.date_range(datetime.now(), periods=48, freq="H")
-    return pd.DataFrame({
-        "time": index,
-        "ghi": np.random.uniform(0, 800, size=48),
-        "temp_air": np.random.uniform(15, 30, size=48)
-    }).set_index("time")
+def lade_wetterdaten(start, end):
+    params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "hourly": "temperature_2m,direct_normal_irradiance,diffuse_radiation,global_radiation",
+        "timezone": "auto"
+    }
+    response = requests.get("https://api.open-meteo.com/v1/forecast", params=params)
+    data = response.json()
+    if "hourly" not in data:
+        raise ValueError("❌ Fehler beim Abrufen der Wetterdaten:\n" + str(data))
+    df = pd.DataFrame(data["hourly"])
+    df["time"] = pd.to_datetime(df["time"])
+    df.set_index("time", inplace=True)
+    df.rename(columns={
+        "global_radiation": "ghi",
+        "direct_normal_irradiance": "dni",
+        "diffuse_radiation": "dhi",
+        "temperature_2m": "temp_air"
+    }, inplace=True)
+    df = df.dropna(subset=["ghi", "dni", "dhi", "temp_air"])
+    return df
 
-# 📊 Berechnung
-def berechne_ertrag(wetter, kwp, neigung, azimut):
+def berechne_ertrag(wetter, azimut, neigung, kwp, bias=1.0):
     solpos = pvlib.solarposition.get_solarposition(
         time=wetter.index,
-        latitude=50.6,
-        longitude=6.3
+        latitude=LAT,
+        longitude=LON
     )
     poa = pvlib.irradiance.get_total_irradiance(
         surface_tilt=neigung,
         surface_azimuth=azimut,
-        dni=None,
+        dni=wetter["dni"],
         ghi=wetter["ghi"],
-        dhi=None,
-        solar_zenith=solpos["zenith"],
+        dhi=wetter["dhi"],
+        solar_zenith=solpos["apparent_zenith"],
         solar_azimuth=solpos["azimuth"]
     )
     irrad = poa["poa_global"]
-    temp_modul = wetter["temp_air"] + (45 - 20) / 800 * irrad
-    eta = 0.85 - 0.004 * (temp_modul - 25)
-    leistung = kwp * irrad * eta / 1000  # in kW
-    return leistung, temp_modul
+    temp_mod = wetter["temp_air"] + (45 - 20) / 800 * irrad
+    leistung = irrad / 1000 * kwp * bias
+    return leistung, temp_mod
 
-# 📈 App
-st.title("PV Ertragsprognose ☀️")
-wetter = lade_wetterdaten()
-leistung, temp_modul = berechne_ertrag(wetter, 11.7, 35, 220)
-gesamt = leistung.resample("D").sum()
-
-st.line_chart(leistung, use_container_width=True)
-st.write(f"🔋 Prognose Tagesertrag: {gesamt.values[0]:.2f} kWh")
-st.write(f"🌡️ Max. Modultemperatur: {temp_modul.max():.1f} °C")
-
-# ✍ Feedback
-feedback = lade_feedback()
-st.subheader("📬 Feedback eintragen")
-heute = datetime.now().date()
-tats = st.number_input("Tatsächlicher Ertrag heute (kWh)", min_value=0.0, step=0.1)
-if st.button("Speichern"):
-    neu = pd.DataFrame([[heute, tats]], columns=["datum", "tatsaechlicher_ertrag_kwh"])
-    feedback = pd.concat([feedback, neu], ignore_index=True)
-    feedback.to_csv("feedback.csv", index=False)
-    st.success("Feedback gespeichert!")
+if __name__ == "__main__":
+    heute = datetime.now().date()
+    ende = heute + timedelta(days=1)
+    wetter = lade_wetterdaten(heute, ende)
+    leistung, temp_mod = berechne_ertrag(wetter, 180, 30, 5)
+    wetter["Leistung_kW"] = leistung
+    wetter["Modul_Temp_C"] = temp_mod
+    wetter[["Leistung_kW", "Modul_Temp_C"]].plot(title="PV-Ertrag & Modultemperatur")
+    plt.tight_layout()
+    plt.savefig("ertrag_plot.png")
+    wetter.to_csv("ertrag_bericht.csv")
